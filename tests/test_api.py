@@ -360,6 +360,127 @@ r = client.post("/api/subdivide",
 d = r.json()
 check("subdivide Point 结构错误", not d["ok"] and "结构错误" in d["error"], str(d)[:200])
 
+# ============================ /api/inscribed-circle ============================
+
+ic_parcel = {"type": "Polygon",
+             "coordinates": [[[0, 0], [120, 0], [120, 80], [0, 80], [0, 0]]]}
+
+# 基本：120×80 矩形 → r=40，圆心 (60,40)，gap ≤ 0.01
+r = client.post("/api/inscribed-circle", json={"parcel": ic_parcel})
+d = r.json()
+check("circle ok", r.status_code == 200 and d["ok"], str(d)[:300])
+check("circle r=40", abs(d["radius_m"] - 40.0) < 1e-6, str(d["radius_m"]))
+check("circle center", d["center"] == [60.0, 40.0], str(d["center"]))
+check("circle gap 字段", d["radius_gap_m"] == d["upper_bound_m"] - d["radius_m"])
+check("circle gap<=0.01", d["upper_bound_m"] - d["radius_m"] <= 0.01 + 1e-9,
+      str(d["upper_bound_m"] - d["radius_m"]))
+check("circle part 字段", d["part_index"] == 0 and d["part_count"] == 1)
+check("circle 面积统计", abs(d["areas"]["remaining_area"] - 9600.0) < 1e-6)
+check("circle result FC", d["result"]["type"] == "FeatureCollection"
+      and len(d["result"]["features"]) == 1)
+feat = d["result"]["features"][0]
+check("circle feature Polygon", feat["geometry"]["type"] == "Polygon")
+check("circle feature properties",
+      abs(feat["properties"]["radius_m"] - 40.0) < 1e-9
+      and feat["properties"]["center"] == [60.0, 40.0])
+
+# 返回的圆面确实完全位于地块内，且半径=圆心到边界实际距离
+from shapely.geometry import Point as _Point, shape as _shape
+_disk = _shape(feat["geometry"])
+_center = _Point(d["center"])
+_region = _shape(ic_parcel)
+check("circle 圆面在地块内", _disk.within(_region.buffer(1e-7)),
+      f"泄漏={_disk.difference(_region).area}")
+check("circle 半径=实际边界距离",
+      abs(_center.distance(_region.boundary) - d["radius_m"]) < 1e-7)
+
+# 带禁建区（先扣再选）：60×35 居中禁建区，可建范围被限制
+ic_hole = {"type": "Polygon",
+           "coordinates": [[[40, 20], [60, 20], [60, 40], [40, 40], [40, 20]]]}
+r = client.post("/api/inscribed-circle",
+                json={"parcel": ic_parcel, "forbidden": ic_hole})
+d = r.json()
+check("circle+禁建 ok", d["ok"], str(d)[:300])
+_region = _shape(ic_parcel).difference(_shape(ic_hole))
+_center = _Point(d["center"])
+_disk = _center.buffer(d["radius_m"])
+check("circle+禁建 圆在可建范围内", _disk.within(_region.buffer(1e-7)),
+      f"泄漏={_disk.difference(_region).area}")
+check("circle+禁建 半径=实际距离",
+      abs(_center.distance(_region.boundary) - d["radius_m"]) < 1e-7,
+      f"{_center.distance(_region.boundary)} vs {d['radius_m']}")
+check("circle+禁建 gap<=0.01", d["upper_bound_m"] - d["radius_m"] <= 0.01 + 1e-9)
+check("circle+禁建 半径受孔限制", d["radius_m"] < 40.0, str(d["radius_m"]))
+
+# 孔洞环同样限制半径：100×100 挖中心 20×20 孔 → r≈23.43（四角口袋）
+ic_ann = {"type": "Polygon", "coordinates": [
+    [[0, 0], [100, 0], [100, 100], [0, 100], [0, 0]],
+    [[40, 40], [60, 40], [60, 60], [40, 60], [40, 40]],
+]}
+r = client.post("/api/inscribed-circle", json={"parcel": ic_ann})
+d = r.json()
+check("circle 孔洞限制半径", d["ok"] and abs(d["radius_m"] - 40 * (2 - 2 ** 0.5)) < 1e-2,
+      str(d.get("radius_m")))
+check("circle 孔洞 gap", d["ok"] and d["upper_bound_m"] - d["radius_m"] <= 0.01 + 1e-9)
+
+# 多个独立面：禁建条带 y∈[30,50] 切成上下两块 120×30，逐面搜索 → r=15
+ic_bar = {"type": "Polygon",
+          "coordinates": [[[0, 30], [120, 30], [120, 50], [0, 50], [0, 30]]]}
+r = client.post("/api/inscribed-circle",
+                json={"parcel": ic_parcel, "forbidden": ic_bar})
+d = r.json()
+check("circle 多面 ok", d["ok"] and d["part_count"] == 2, str(d)[:200])
+check("circle 多面 r=15", abs(d["radius_m"] - 15.0) < 1e-3, str(d["radius_m"]))
+check("circle 多面 gap", d["upper_bound_m"] - d["radius_m"] <= 0.01 + 1e-9)
+
+# 无禁建区字段 / null
+r = client.post("/api/inscribed-circle", json={"parcel": ic_parcel, "forbidden": None})
+check("circle null 禁建区", r.json()["ok"] and abs(r.json()["radius_m"] - 40.0) < 1e-6)
+
+# 扣空 → 报错且不输出圆
+ic_cover = {"type": "Polygon",
+            "coordinates": [[[-1, -1], [121, -1], [121, 81], [-1, 81], [-1, -1]]]}
+r = client.post("/api/inscribed-circle",
+                json={"parcel": ic_parcel, "forbidden": ic_cover})
+d = r.json()
+check("circle 扣空报错", not d["ok"] and "扣除" in d["error"], str(d)[:200])
+check("circle 扣空无结果", ("result" not in d) and ("radius_m" not in d))
+
+# 无效几何 → 同一套校验与定位
+r = client.post("/api/inscribed-circle",
+                json={"parcel": {"type": "Polygon",
+                                 "coordinates": [[[0, 0], [1, 0], [2, 0], [0, 0]]]}})
+d = r.json()
+check("circle 无效几何报错",
+      not d["ok"] and d["issues"][0]["code"] == "ZERO_AREA_RING", str(d)[:200])
+
+# 禁建区无效也报错（复用同一套校验）
+r = client.post("/api/inscribed-circle", json={
+    "parcel": ic_parcel,
+    "forbidden": {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "id": "bad", "geometry":
+         {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [2, 0], [0, 0]]]}}]},
+})
+d = r.json()
+check("circle 禁建区无效报错",
+      not d["ok"] and d["issues"][0]["layer"] == "forbidden"
+      and d["issues"][0]["feature_id"] == "bad", str(d)[:200])
+
+# 多地块拒绝
+r = client.post("/api/inscribed-circle", json={"parcel": two_parcels})
+d = r.json()
+check("circle 多地块拒绝", not d["ok"] and "恰好包含一个" in d["error"], str(d)[:200])
+
+# 顶层类型错误
+r = client.post("/api/inscribed-circle",
+                json={"parcel": {"type": "Point", "coordinates": [1, 2]}})
+d = r.json()
+check("circle Point 结构错误", not d["ok"] and "结构错误" in d["error"], str(d)[:200])
+
+# 缺地块 → 422
+r = client.post("/api/inscribed-circle", json={"forbidden": None})
+check("circle 缺地块 422", r.status_code == 422)
+
 print()
 if fails:
     print(f"{len(fails)} 个失败: {fails}")

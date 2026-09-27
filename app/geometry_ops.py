@@ -11,17 +11,21 @@
 
 from __future__ import annotations
 
+import heapq
 import math
 import re
 from typing import Any
 
+import numpy as np
 from shapely import is_valid_reason, union_all
 from shapely.geometry import (
     LineString,
     MultiPolygon,
+    Point,
     Polygon,
 )
 from shapely.geometry.base import BaseGeometry
+from shapely.prepared import prep
 from shapely.strtree import STRtree
 
 # 小于该面积（平方米）视为零面积退化环
@@ -975,5 +979,346 @@ def subdivide_parcel(
         "total_area": total,
         "target_area": total / count,
         "area_tolerance": tol,
+        "areas": clip["areas"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 最大可容圆（largest inscribed circle）选址
+# ---------------------------------------------------------------------------
+
+# 对外保证：上界 − 半径 ≤ 0.01 米；内部用更紧的阈值留出数值余量
+INSCRIBED_RADIUS_GAP_LIMIT = 0.01
+_INSCRIBED_TOL = 0.004
+# 分支定界初始网格每维格数（性能与逼近质量的折中）
+_INSCRIBED_INIT_GRID = 24
+
+
+class InscribedCircleError(Exception):
+    """最大可容圆选址的前置条件不满足（如可建范围为空）。"""
+
+
+def _face_segments(poly: Polygon) -> np.ndarray:
+    """提取一个面外环 + 全部孔洞环的唯一线段，返回端点数组 (N,2,2)。
+
+    孔洞环与外环一样限制可容圆半径；去重共享线段（如裁切产生的退化重合边）
+    不影响最短距离，只是减少计算量。
+    """
+    seen: set[tuple] = set()
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for ring in _iter_rings(poly):
+        coords = list(ring.coords)
+        for i in range(len(coords) - 1):
+            a, b = coords[i], coords[i + 1]
+            key = tuple(sorted(((round(a[0], 12), round(a[1], 12)),
+                                (round(b[0], 12), round(b[1], 12)))))
+            if key in seen:
+                continue
+            seen.add(key)
+            segments.append((a, b))
+    if not segments:  # pragma: no cover - 有效面至少有外环
+        return np.zeros((0, 2, 2))
+    return np.array(segments, dtype=float)
+
+
+# 线段数小于该阈值时用纯 Python 算距离（numpy 对小数组的启动开销更高）
+_DISTANCE_PY_THRESHOLD = 60
+# 每格取最近的若干条边界线段，用「矩形四角到该线段的最大距离」进一步收紧上界
+_BOUND_NEAREST_K = 4
+
+
+def _point_segment_d2(
+    seg: tuple[float, float, float, float], px: float, py: float
+) -> float:
+    """点到单条线段的距离平方（纯标量，供小数组与最近边收紧上界使用）。"""
+    ax, ay, bx, by = seg
+    dx, dy = bx - ax, by - ay
+    denom = dx * dx + dy * dy
+    if denom == 0.0:
+        qx, qy = ax - px, ay - py
+    else:
+        t = ((px - ax) * dx + (py - ay) * dy) / denom
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+        qx, qy = ax + t * dx - px, ay + t * dy - py
+    return qx * qx + qy * qy
+
+
+def _segments_distance(
+    arr: np.ndarray,
+    py_segments: list[tuple[float, float, float, float]],
+    px: float,
+    py: float,
+) -> float:
+    """点 (px, py) 到线段集合的最短距离（外环 + 全部孔洞环）。
+
+    线段数少时用纯 Python（避免 numpy 小数组的启动开销，小面 / 分支定界中
+    调用数十万次），线段数多时切换 numpy 向量化。
+    """
+    if len(py_segments) < _DISTANCE_PY_THRESHOLD:
+        best = math.inf
+        for seg in py_segments:
+            d2 = _point_segment_d2(seg, px, py)
+            if d2 < best:
+                best = d2
+        return math.sqrt(best)
+
+    a = arr[:, 0, :]
+    ab = arr[:, 1, :] - a
+    denom = ab[:, 0] ** 2 + ab[:, 1] ** 2
+    t = np.where(denom > 0.0,
+                 ((px - a[:, 0]) * ab[:, 0] + (py - a[:, 1]) * ab[:, 1]) / denom,
+                 0.0)
+    t = np.clip(t, 0.0, 1.0)
+    dx = a[:, 0] + t * ab[:, 0] - px
+    dy = a[:, 1] + t * ab[:, 1] - py
+    return float(np.sqrt(dx * dx + dy * dy).min())
+
+
+def _nearest_segments(
+    arr: np.ndarray,
+    py_segments: list[tuple[float, float, float, float]],
+    px: float,
+    py: float,
+    k: int = _BOUND_NEAREST_K,
+) -> list[tuple[float, tuple[float, float, float, float]]]:
+    """返回离 (px, py) 最近的至多 k 条线段：[(距离平方, 线段四元组), ...]。"""
+    if len(py_segments) < _DISTANCE_PY_THRESHOLD:
+        scored = [(_point_segment_d2(seg, px, py), seg) for seg in py_segments]
+        scored.sort(key=lambda x: x[0])
+        return scored[:k]
+
+    a = arr[:, 0, :]
+    ab = arr[:, 1, :] - a
+    denom = ab[:, 0] ** 2 + ab[:, 1] ** 2
+    t = np.where(denom > 0.0,
+                 ((px - a[:, 0]) * ab[:, 0] + (py - a[:, 1]) * ab[:, 1]) / denom,
+                 0.0)
+    t = np.clip(t, 0.0, 1.0)
+    dx = a[:, 0] + t * ab[:, 0] - px
+    dy = a[:, 1] + t * ab[:, 1] - py
+    d2 = dx * dx + dy * dy
+    kk = min(k, len(py_segments))
+    idx = np.argpartition(d2, kk - 1)[:kk]
+    out = [(float(d2[i]), py_segments[int(i)]) for i in idx]
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _largest_circle_in_face(
+    poly: Polygon,
+    radius_incumbent: float,
+    tol: float = _INSCRIBED_TOL,
+) -> dict:
+    """在单个独立面上求最大可容圆。
+
+    分支定界：在面的 bbox 上铺初始矩形网格，每格的上界取两条合法上界的
+    最小值——
+        (a) 中心到该面全部边界线段的距离 + 格半对角
+            （点到线段距离 1-Lipschitz）；
+        (b) 中心附近最近的若干条边界线段各自到格四角的最大距离
+            （矩形内一点到固定线段的距离必在某个角点取最大值）。
+    孔洞环与外环都在距离计算中，孔洞与外边界同时限制半径。(b) 对极狭长
+    面尤为关键：当格的长边方向很长时 (a) 很松，(b) 能立刻按最近的上下
+    边界把半径封死，避免沿长边无意义地细分。
+
+    按上界优先分裂，每次只沿格的**长边中分为二**（bintree，避免极狭长
+    面在短边上指数爆炸）；中心在面外且整格都在面外（到边界距离 > 半对角）
+    的格子直接剪枝。上界不再超过 max(当前最优, 全局最优) + tol 时闭合并
+    更新上界。
+
+    半径取圆心到该面边界的实际最短距离，不从质心 / 包围盒中心估计。
+    """
+    arr = _face_segments(poly)
+    py_segments = [
+        (float(row[0][0]), float(row[0][1]),
+         float(row[1][0]), float(row[1][1]))
+        for row in arr
+    ]
+    prepared = prep(poly)
+
+    minx, miny, maxx, maxy = poly.bounds
+    sx, sy = maxx - minx, maxy - miny
+
+    # 平凡上界：圆必须整体落在 bbox 内，半径不超过短边一半；
+    # 若连初始上界都超不过已有全局最优 + tol，无需搜索。
+    cap = min(sx, sy) / 2.0
+    if cap <= radius_incumbent + tol:
+        return {"center": None, "radius": 0.0, "upper_bound": cap, "evaluated": False}
+
+    nx = ny = _INSCRIBED_INIT_GRID
+    hx0, hy0 = sx / (2 * nx), sy / (2 * ny)
+
+    best_r = 0.0
+    best_c: tuple[float, float] | None = None
+
+    def seed(x: float, y: float) -> None:
+        nonlocal best_r, best_c
+        if prepared.covers(Point(x, y)):
+            d = _segments_distance(arr, py_segments, x, y)
+            if d > best_r:
+                best_r, best_c = d, (x, y)
+
+    # 内点保证（representative_point 必在面内）、质心与规则网格种子：
+    # 尽早逼近最优，使剪枝阈值快速收紧——不把这些点直接当作答案。
+    rp = poly.representative_point()
+    seed(rp.x, rp.y)
+    seed(float(poly.centroid.x), float(poly.centroid.y))
+    for i in range(nx):
+        cx = minx + (2 * i + 1) * sx / (2 * nx)
+        for j in range(ny):
+            cy = miny + (2 * j + 1) * sy / (2 * ny)
+            seed(cx, cy)
+
+    # 种子（内点 + 网格）已经达到 bbox 直径上界 → 已是该面上的全局最优，
+    # 无需任何分裂。细长条带等长宽比极端的形状在此直接返回。
+    if cap <= max(best_r, radius_incumbent) + tol:
+        radius = best_r if best_c is not None else 0.0
+        return {"center": best_c, "radius": radius,
+                "upper_bound": max(cap, radius), "evaluated": True}
+
+    def cell_bound(cx: float, cy: float, hx: float, hy: float) -> float | None:
+        """返回格上界并顺带更新当前最优；整格在面外时返回 None。
+
+        上界取以下合法上界的最小值：
+        1) 中心到边界距离 + 格半对角（点到线段距离 1-Lipschitz）；
+        2) 对中心附近最近的若干条边界线段 e，取「矩形四角到 e 的最大距离」。
+           矩形内任一点到固定线段的距离必在某个角点取到最大值，而面内任意
+           点的可容半径不超过它到任一边界线段的距离，故该值也是合法上界。
+           这一项对极狭长面尤为关键：长边方向很长时 (1) 很松，(2) 则能
+           立刻按上下边界把半径封死。
+        """
+        nonlocal best_r, best_c
+        halfdiag = math.hypot(hx, hy)
+        nearest = _nearest_segments(arr, py_segments, cx, cy)
+        d = math.sqrt(nearest[0][0])
+        if prepared.covers(Point(cx, cy)):
+            if d > best_r:
+                best_r, best_c = d, (cx, cy)
+        elif d > halfdiag:
+            # 中心在面外且整格都在面外（到边界距离 > 半对角）→ 不含内点
+            return None
+
+        ub = d + halfdiag
+        corners = (
+            (cx - hx, cy - hy), (cx + hx, cy - hy),
+            (cx + hx, cy + hy), (cx - hx, cy + hy),
+        )
+        for _, seg in nearest:
+            edge_ub = max(
+                math.sqrt(_point_segment_d2(seg, qx, qy)) for qx, qy in corners
+            )
+            if edge_ub < ub:
+                ub = edge_ub
+        return ub
+
+    heap: list[tuple[float, int, tuple[float, float, float, float]]] = []
+    counter = 0
+
+    def push(cx: float, cy: float, hx: float, hy: float) -> None:
+        nonlocal counter
+        ub = cell_bound(cx, cy, hx, hy)
+        if ub is not None:
+            heapq.heappush(heap, (-ub, counter, (cx, cy, hx, hy)))
+            counter += 1
+
+    for i in range(nx):
+        cx = minx + (2 * i + 1) * sx / (2 * nx)
+        for j in range(ny):
+            cy = miny + (2 * j + 1) * sy / (2 * ny)
+            push(cx, cy, hx0, hy0)
+
+    closed_ub = best_r
+    while heap:
+        neg_ub, _, (cx, cy, hx, hy) = heapq.heappop(heap)
+        ub = -neg_ub
+        threshold = max(best_r, radius_incumbent) + tol
+        if ub <= threshold:
+            if ub > closed_ub:
+                closed_ub = ub
+            continue
+        if math.hypot(hx, hy) < 1e-10:  # pragma: no cover - 数值退化兜底
+            if ub > closed_ub:
+                closed_ub = ub
+            continue
+        # 只沿长边中分为二：对极狭长的面，短边方向不再产生指数级格数，
+        # 上界 d + 半对角随长边半长线性收紧，正确性不变。
+        if hx >= hy:
+            nhx, nhy = hx / 2.0, hy
+            for sgn in (-1, 1):
+                ncx, ncy = cx + sgn * hx / 2.0, cy
+                if ncx + nhx < minx or ncx - nhx > maxx:
+                    continue
+                push(ncx, ncy, nhx, nhy)
+        else:
+            nhx, nhy = hx, hy / 2.0
+            for sgn in (-1, 1):
+                ncx, ncy = cx, cy + sgn * hy / 2.0
+                if ncy + nhy < miny or ncy - nhy > maxy:
+                    continue
+                push(ncx, ncy, nhx, nhy)
+
+    if best_c is None:  # pragma: no cover - 非空面必有 representative_point
+        return {"center": None, "radius": 0.0, "upper_bound": cap, "evaluated": True}
+
+    # 半径 = 圆心到边界（外环 + 孔洞环）的实际最短距离
+    radius = _segments_distance(arr, py_segments, best_c[0], best_c[1])
+    upper_bound = max(closed_ub, radius)
+    return {
+        "center": best_c,
+        "radius": radius,
+        "upper_bound": min(upper_bound, cap),
+        "evaluated": True,
+    }
+
+
+def inscribed_circle_parcel(
+    parcel_geoms: list[Polygon | MultiPolygon],
+    forbidden_geoms: list[Polygon | MultiPolygon],
+) -> dict:
+    """先扣除禁建区求可建范围，再在所有独立面上求最大可容圆。
+
+    - 逐面做分支定界，并以已知全局最优半径提前剪枝；
+    - 最终在全部候选中取半径最大者，上界取各面上界的最大值
+      （保证 上界 − 半径 ≤ 0.01 米）；
+    - 可建范围为空（扣空）时抛 InscribedCircleError。
+    """
+    clip = clip_parcel(parcel_geoms, forbidden_geoms)
+    parts = clip["parts"]
+    if not parts:
+        raise InscribedCircleError(
+            "地块被禁建区完全扣除，可建范围为 0，无法进行最大可容圆选址"
+        )
+
+    # 先处理“可能容纳大圆”的面（短边一半较大），使全局剪枝尽快生效
+    ordered = sorted(
+        parts,
+        key=lambda p: min(p.bounds[2] - p.bounds[0], p.bounds[3] - p.bounds[1]),
+        reverse=True,
+    )
+
+    incumbent = 0.0
+    best: dict | None = None
+    best_index = -1
+    global_ub = 0.0
+    for poly in ordered:
+        res = _largest_circle_in_face(poly, incumbent)
+        if res["upper_bound"] > global_ub:
+            global_ub = res["upper_bound"]
+        if res["center"] is not None and res["radius"] > incumbent:
+            incumbent = res["radius"]
+            best = res
+            best_index = parts.index(poly)
+
+    radius = float(best["radius"])
+    cx, cy = best["center"]
+    return {
+        "center": (float(cx), float(cy)),
+        "radius": radius,
+        "upper_bound": float(max(global_ub, radius)),
+        "part_index": best_index,
+        "part_count": len(parts),
         "areas": clip["areas"],
     }

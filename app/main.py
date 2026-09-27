@@ -11,16 +11,18 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from shapely.geometry import mapping
+from shapely.geometry import Point, mapping
 from shapely.geometry.base import BaseGeometry
 
 from .geometry_ops import (
     SUBDIVIDE_MAX_COUNT,
     SUBDIVIDE_MIN_COUNT,
     GeoJSONError,
+    InscribedCircleError,
     SubdivideError,
     audit_relations,
     clip_parcel,
+    inscribed_circle_parcel,
     subdivide_parcel,
     validate_layer_indexed,
 )
@@ -237,9 +239,59 @@ def subdivide(req: SubdivideRequest) -> dict:
     }
 
 
+@app.post("/api/inscribed-circle")
+def inscribed_circle(req: ClipRequest) -> dict:
+    """最大可容圆选址：先求可建范围，再在所有独立面上找完全位于范围内的最大圆。"""
+    parcel_records, forbidden_records, err = _validate_payload(req)
+    if err is not None:
+        return err
+
+    if len(parcel_records) != 1:
+        return _error_response("地块必须恰好包含一个 Polygon / MultiPolygon 要素")
+
+    parcel_geoms = [geom for _, _, geom in parcel_records]
+    forbidden_geoms = [geom for _, _, geom in forbidden_records]
+
+    try:
+        result = inscribed_circle_parcel(parcel_geoms, forbidden_geoms)
+    except InscribedCircleError as exc:
+        return _error_response(str(exc))
+
+    cx, cy = result["center"]
+    radius = result["radius"]
+    # 圆以高分辨率 buffer 输出为 Polygon（48 段/四分圆），供页面直接绘制
+    circle = Point(cx, cy).buffer(radius, quad_segs=48)
+    feature = {
+        "type": "Feature",
+        "properties": {
+            "center": [cx, cy],
+            "radius_m": radius,
+            "upper_bound_m": result["upper_bound"],
+            "radius_gap_m": result["upper_bound"] - radius,
+            "part_index": result["part_index"],
+            "part_count": result["part_count"],
+        },
+        "geometry": mapping(circle),
+    }
+
+    return {
+        "ok": True,
+        "center": [cx, cy],
+        "radius_m": radius,
+        "upper_bound_m": result["upper_bound"],
+        "radius_gap_m": result["upper_bound"] - radius,
+        "part_index": result["part_index"],
+        "part_count": result["part_count"],
+        "areas": result["areas"],
+        "result": {"type": "FeatureCollection", "features": [feature]},
+        "issues": [],
+    }
+
+
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
+
 
 @app.get("/")
 def index() -> FileResponse:

@@ -563,6 +563,149 @@ check("sub: angle=0 合法", len(r["segments"]) == 2)
 r = subdivide_parcel(sq100, [], 2, 179.999)
 check("sub: angle<180 合法", len(r["segments"]) == 2)
 
+# ---------- 33. 最大可容圆：基础图形 ----------
+from app.geometry_ops import (
+    INSCRIBED_RADIUS_GAP_LIMIT,
+    InscribedCircleError,
+    inscribed_circle_parcel,
+)
+from shapely.geometry import Point as ShPoint
+
+
+def circle_poly_coords(rings):
+    return {"type": "Polygon", "coordinates": rings}
+
+
+def check_circle(name, parcel_obj, forbidden_objs, expected_r=None,
+                 tol_r=1e-3, expected_center=None):
+    geoms, issues = validate_layer(parcel_obj, "parcel")
+    assert not issues, issues
+    fgeoms = []
+    for fobj in forbidden_objs or []:
+        gs, iss = validate_layer(fobj, "forbidden")
+        assert not iss, iss
+        fgeoms.extend(gs)
+    res = inscribed_circle_parcel(geoms, fgeoms)
+    gap = res["upper_bound"] - res["radius"]
+    center = ShPoint(res["center"])
+    # 圆必须完全位于可建范围内（含孔洞扣减）
+    region = geoms[0]
+    for g in fgeoms:
+        region = region.difference(g)
+    disk = center.buffer(res["radius"])
+    check(f"{name}: gap<=0.01", gap <= INSCRIBED_RADIUS_GAP_LIMIT + 1e-9,
+          f"gap={gap}")
+    check(f"{name}: 上界>=半径", res["upper_bound"] >= res["radius"] - 1e-12)
+    check(f"{name}: 圆完全位于范围内",
+          disk.difference(region).area <= 1e-7 * max(1.0, res["radius"] ** 2),
+          f"泄漏面积={disk.difference(region).area}")
+    # 半径必须等于圆心到边界的实际最短距离
+    d = center.distance(region.boundary)
+    check(f"{name}: 半径=圆心到边界实际距离", abs(d - res["radius"]) < 1e-7,
+          f"d={d} r={res['radius']}")
+    if expected_r is not None:
+        check(f"{name}: 半径={expected_r}",
+              abs(res["radius"] - expected_r) < tol_r,
+              f"r={res['radius']} exp={expected_r}")
+    if expected_center is not None:
+        check(f"{name}: 圆心",
+              abs(res["center"][0] - expected_center[0]) < 1e-3
+              and abs(res["center"][1] - expected_center[1]) < 1e-3,
+              str(res["center"]))
+    return res
+
+
+sq_obj = {"type": "Polygon",
+          "coordinates": [[[0, 0], [100, 0], [100, 100], [0, 100], [0, 0]]]}
+check_circle("circle 正方形", sq_obj, [], 50.0, expected_center=(50, 50))
+rect_obj = {"type": "Polygon",
+            "coordinates": [[[0, 0], [120, 0], [120, 80], [0, 80], [0, 0]]]}
+check_circle("circle 矩形", rect_obj, [], 40.0)
+# 等腰直角三角形：内切圆半径 a(2-√2)/2
+tri_obj = {"type": "Polygon",
+           "coordinates": [[[0, 0], [100, 0], [0, 100], [0, 0]]]}
+check_circle("circle 三角形", tri_obj, [], 100 * (2 - 2 ** 0.5) / 2, tol_r=1e-2)
+
+# 34. 孔洞限制半径：100×100 挖 20×20 中心孔 → 四角口袋最大 r = 40(2-√2)
+annulus_obj = {"type": "Polygon", "coordinates": [
+    [[0, 0], [100, 0], [100, 100], [0, 100], [0, 0]],
+    [[40, 40], [60, 40], [60, 60], [40, 60], [40, 40]],
+]}
+res = check_circle("circle 中心孔环", annulus_obj, [], 40 * (2 - 2 ** 0.5), tol_r=5e-3)
+# 圆心必须离孔与离外墙相等级别，且不在孔内
+hole_center = ShPoint(50, 50)
+check("circle 孔环：圆心在孔外", ShPoint(res["center"]).distance(hole_center) > 15.0,
+      str(res["center"]))
+
+# 偏心孔：100×60 大矩形，左部 x∈[5,35] 被 30×50 的孔占住 →
+# 右廊宽 65、上下留 5，最优 r=30，圆心 (67.5, 30)
+off_hole = {"type": "Polygon", "coordinates": [
+    [[0, 0], [100, 0], [100, 60], [0, 60], [0, 0]],
+    [[5, 5], [35, 5], [35, 55], [5, 55], [5, 5]],
+]}
+check_circle("circle 偏心孔", off_hole, [], 30.0, tol_r=2e-3,
+             expected_center=(67.5, 30))
+
+# 35. 禁建区把地块切成两个独立面：必须逐面搜索并取最大
+bar_obj = {"type": "Polygon",
+           "coordinates": [[[0, 40], [100, 40], [100, 60], [0, 60], [0, 40]]]}
+# 剩上下两个 100×40 条带 → r=20
+res = check_circle("circle 禁建区分隔双带", sq_obj, [bar_obj], 20.0)
+check("circle 双带 part_count=2", res["part_count"] == 2, str(res["part_count"]))
+
+# 两个大小不同的独立面：圆应落在大面内
+two_sq_obj = {"type": "MultiPolygon", "coordinates": [
+    [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]],
+    [[[20, 0], [60, 0], [60, 40], [20, 40], [20, 0]]],
+]}
+res = check_circle("circle 多面取大", two_sq_obj, [], 20.0,
+                   expected_center=(40, 20))
+check("circle 多面 part_index", res["part_index"] == 1, str(res["part_index"]))
+
+# 36. 细长条带：100×2 → r=1（验证不是质心/包围盒中心瞎估：质心恰好在，
+# 但另一组 100×2 偏移面同样成立；重点是半径取到边界距离）
+strip_obj = {"type": "Polygon",
+             "coordinates": [[[0, 0], [100, 0], [100, 2], [0, 2], [0, 0]]]}
+check_circle("circle 细条带", strip_obj, [], 1.0, tol_r=1e-3)
+
+# 37. L 形（凹角限制半径）：r = 50(2-√2)
+l_obj = {"type": "Polygon", "coordinates":
+         [[[0, 0], [100, 0], [100, 50], [50, 50], [50, 100], [0, 100], [0, 0]]]}
+check_circle("circle L形", l_obj, [], 50 * (2 - 2 ** 0.5), tol_r=5e-3)
+
+# 38. 禁建区共点共边不扣面积 → 圆与无禁建区一致
+touch_corner = {"type": "Polygon",
+                "coordinates": [[[100, 100], [110, 100], [110, 110], [100, 110], [100, 100]]]}
+touch_edge = {"type": "Polygon",
+              "coordinates": [[[20, -10], [80, -10], [80, 0], [20, 0], [20, -10]]]}
+res = check_circle("circle 共点共边不影响", sq_obj, [touch_corner, touch_edge], 50.0)
+
+# 39. 扣空报错
+cover_obj = {"type": "Polygon",
+             "coordinates": [[[-10, -10], [110, -10], [110, 110], [-10, 110], [-10, -10]]]}
+geoms, _ = validate_layer(sq_obj, "parcel")
+fgeoms, _ = validate_layer(cover_obj, "forbidden")
+try:
+    inscribed_circle_parcel(geoms, fgeoms)
+    check("circle 扣空报错", False)
+except InscribedCircleError as exc:
+    check("circle 扣空报错", "扣除" in str(exc), str(exc))
+
+# 40. 大坐标尺度（UTM 级，数十公里）半径仍精确、gap 仍 ≤ 0.01 米
+big_obj = {"type": "Polygon", "coordinates": [[
+    [500000, 4000000], [501000, 4000000], [501000, 4001000],
+    [500000, 4001000], [500000, 4000000]]]}
+geoms, _ = validate_layer(big_obj, "parcel")
+res = inscribed_circle_parcel(geoms, [])
+check("circle 大坐标 r=500", abs(res["radius"] - 500.0) < 1e-6, str(res["radius"]))
+check("circle 大坐标 gap<=0.01", res["upper_bound"] - res["radius"] <= 0.01 + 1e-9)
+check("circle 大坐标圆心", abs(res["center"][0] - 500500.0) < 1e-6
+      and abs(res["center"][1] - 4000500.0) < 1e-6, str(res["center"]))
+
+# 41. 无禁建区时面积统计与裁切一致
+res = inscribed_circle_parcel(sq100, [])
+check("circle 面积统计", abs(res["areas"]["remaining_area"] - 10000.0) < 1e-9)
+
 print()
 if failures:
     print(f"{len(failures)} 个失败: {failures}")

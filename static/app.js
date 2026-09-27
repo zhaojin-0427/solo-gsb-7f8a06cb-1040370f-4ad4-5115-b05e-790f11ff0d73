@@ -29,6 +29,12 @@ const LAYERS = {
     width: 2,
   },
   segments: { show: true }, // 分段按段着色，颜色取自 SEGMENT_COLORS
+  circle: {
+    show: true,
+    fill: "rgba(217,168,59,0.22)",
+    stroke: "#c98a12",
+    width: 2.5,
+  },
 };
 
 // 等面积分段的调色板（最多 12 段，与分段数量上限一致）
@@ -50,6 +56,7 @@ const view = {
   activeRelation: -1, // 高亮的禁建区要素索引
   segments: [], // [{polys, info}] 等面积分段结果，按下标即段号-1
   activeSegment: -1, // 高亮的段下标
+  circle: null, // {poly, center:[x,y], radius, upperBound, gap, partIndex, partCount}
 };
 
 // 六类关系的展示文案与描边色（与列表徽章配色一致）
@@ -339,6 +346,7 @@ function draw() {
   if (LAYERS.forbidden.show) drawForbidden();
   if (LAYERS.result.show) drawLayer(view.resultPolys, "result");
   if (LAYERS.segments.show) drawSegments();
+  if (LAYERS.circle.show) drawCircle();
 
   drawIssueMarkers();
 }
@@ -397,6 +405,54 @@ function drawSegments() {
       ctx.fillText(`段 ${i + 1}`, sx, sy);
     }
   });
+}
+
+/** 画最大可容圆：填充 + 描边，圆心十字标记，半径虚线连到最近边界方向。 */
+function drawCircle() {
+  const c = view.circle;
+  if (!c) return;
+  const style = LAYERS.circle;
+  for (const poly of c.polys) {
+    const path = polygonPath(poly);
+    ctx.fillStyle = style.fill;
+    ctx.fill(path, "evenodd");
+    ctx.strokeStyle = style.stroke;
+    ctx.lineWidth = style.width;
+    ctx.stroke(path);
+  }
+  const [sx, sy] = toScreen(c.center[0], c.center[1]);
+  const sr = c.radius * transform.scale;
+
+  // 圆心标记
+  ctx.beginPath();
+  ctx.arc(sx, sy, 3.5, 0, Math.PI * 2);
+  ctx.fillStyle = style.stroke;
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = "#ffffff";
+  ctx.stroke();
+
+  // 半径虚线（指向 +x，长度即实际半径）
+  ctx.save();
+  ctx.setLineDash([5, 4]);
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.lineTo(sx + sr, sy);
+  ctx.strokeStyle = style.stroke;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.restore();
+
+  // 数值标注
+  ctx.font = "bold 13px sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "bottom";
+  const label = `r = ${fmtNum(c.radius, 3)} m`;
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgba(255,255,255,0.9)";
+  ctx.strokeText(label, sx + 6, sy - 4);
+  ctx.fillStyle = style.stroke;
+  ctx.fillText(label, sx + 6, sy - 4);
 }
 
 function drawIssueMarkers() {
@@ -472,6 +528,7 @@ function currentBounds() {
   b = mergeBounds(b, boundsOf(view.forbiddenPolys));
   b = mergeBounds(b, boundsOf(view.resultPolys));
   for (const seg of view.segments) b = mergeBounds(b, boundsOf(seg.polys));
+  if (view.circle) b = mergeBounds(b, boundsOf(view.circle.polys));
   return b;
 }
 
@@ -480,6 +537,7 @@ for (const [key, id] of [
   ["forbidden", "show-forbidden"],
   ["result", "show-result"],
   ["segments", "show-segments"],
+  ["circle", "show-circle"],
 ]) {
   $(id).addEventListener("change", (e) => {
     LAYERS[key].show = e.target.checked;
@@ -578,6 +636,7 @@ function focusIssue(i) {
 
 let lastResultGeoJSON = null;
 let lastSubdivideGeoJSON = null;
+let lastCircleGeoJSON = null;
 
 /** 清除关系审计结果与高亮（重新预览 / 裁切 / 输入变更时调用）。 */
 function resetRelations() {
@@ -599,9 +658,21 @@ function clearSubdivision() {
   draw();
 }
 
-// 任一输入（地块 / 禁建区 / 数量 / 角度）改变时清除旧分段
+/** 清除最大可容圆结果（输入变更或执行其他动作时调用）。 */
+function clearCircle() {
+  view.circle = null;
+  lastCircleGeoJSON = null;
+  $("circle-panel").hidden = true;
+  $("circle-metrics").innerHTML = "";
+  draw();
+}
+
+// 任一输入（地块 / 禁建区 / 数量 / 角度）改变时清除旧分段与旧选址圆
 for (const el of [parcelInput, forbiddenInput, $("subdivide-count"), $("subdivide-angle")]) {
-  el.addEventListener("input", clearSubdivision);
+  el.addEventListener("input", () => {
+    clearSubdivision();
+    clearCircle();
+  });
 }
 
 function readInputs() {
@@ -633,6 +704,7 @@ function previewInputs() {
   renderIssues([]);
   resetRelations();
   clearSubdivision();
+  clearCircle();
   lastResultGeoJSON = null;
   $("btn-download").disabled = true;
   $("btn-view-json").disabled = true;
@@ -669,6 +741,7 @@ async function runClip() {
   renderIssues([]);
   resetRelations();
   clearSubdivision();
+  clearCircle();
   lastResultGeoJSON = null;
   $("btn-download").disabled = true;
   $("btn-view-json").disabled = true;
@@ -825,6 +898,7 @@ async function runRelations() {
   renderIssues([]);
   resetRelations();
   clearSubdivision();
+  clearCircle();
   lastResultGeoJSON = null;
   $("btn-download").disabled = true;
   $("btn-view-json").disabled = true;
@@ -971,6 +1045,7 @@ async function runSubdivide() {
   renderIssues([]);
   resetRelations();
   clearSubdivision();
+  clearCircle();
   lastResultGeoJSON = null;
   $("btn-download").disabled = true;
   $("btn-view-json").disabled = true;
@@ -1063,6 +1138,132 @@ $("btn-view-subdivide-json").addEventListener("click", () => {
   if (!panel.hidden) panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 });
 
+// ---------------------------------------------------------------------------
+// 最大可容圆选址
+// ---------------------------------------------------------------------------
+
+function renderCircle(data) {
+  view.circle = {
+    polys: extractPolygons(
+      (data.result.features || []).map((f) => f.geometry)
+    ),
+    center: data.center,
+    radius: data.radius_m,
+    upperBound: data.upper_bound_m,
+    gap: data.radius_gap_m,
+    partIndex: data.part_index,
+    partCount: data.part_count,
+  };
+
+  const panel = $("circle-panel");
+  const box = $("circle-metrics");
+  box.innerHTML = "";
+  const addMetric = (label, value, main) => {
+    const card = document.createElement("div");
+    card.className = "circle-metric" + (main ? " circle-metric-main" : "");
+    const l = document.createElement("span");
+    l.className = "stat-label";
+    l.textContent = label;
+    const v = document.createElement("span");
+    v.className = "stat-value";
+    v.textContent = value;
+    card.appendChild(l);
+    card.appendChild(v);
+    box.appendChild(card);
+  };
+  addMetric("最大圆半径", `${fmtNum(data.radius_m, 3)} m`, true);
+  addMetric("圆心坐标 (x, y)", `(${fmtNum(data.center[0], 3)}, ${fmtNum(data.center[1], 3)})`);
+  addMetric("最大半径上界", `${fmtNum(data.upper_bound_m, 3)} m`);
+  addMetric("上界 − 半径（≤ 0.01 m）", `${fmtNum(data.radius_gap_m, 4)} m`);
+  addMetric(
+    "所在独立面",
+    data.part_count > 1
+      ? `第 ${data.part_index + 1} 个 / 共 ${data.part_count} 个独立面`
+      : `唯一独立面（共 ${data.part_count} 个）`
+  );
+  addMetric("可建剩余面积", fmtArea(data.areas.remaining_area));
+  panel.hidden = false;
+  draw();
+}
+
+async function runCircle() {
+  $("json-panel").hidden = true;
+  renderStats(null);
+  renderIssues([]);
+  resetRelations();
+  clearSubdivision();
+  clearCircle();
+  lastResultGeoJSON = null;
+  $("btn-download").disabled = true;
+  $("btn-view-json").disabled = true;
+  view.resultPolys = [];
+
+  let payload;
+  try {
+    payload = readInputs();
+  } catch (e) {
+    setStatus(e.message, "error");
+    return;
+  }
+
+  try {
+    setPreviewLayers(payload);
+  } catch {
+    /* 预览失败不影响请求 */
+  }
+
+  setStatus("正在可建范围所有独立面上搜索最大可容圆…");
+  try {
+    const resp = await fetch("/api/inscribed-circle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+
+    if (!data.ok) {
+      renderIssues(data.issues);
+      fitTo(mergeBounds(currentBounds(), issueBounds(view.issues)) || currentBounds());
+      setStatus(
+        data.issues && data.issues.length
+          ? data.error + `（共 ${data.issues.length} 个问题，点击列表可定位）`
+          : data.error,
+        "error"
+      );
+      return;
+    }
+
+    lastCircleGeoJSON = data.result;
+    renderStats(data.areas);
+    renderIssues([]);
+    // 圆是本次动作的主结果，图层被关掉时重新打开
+    if (!LAYERS.circle.show) {
+      LAYERS.circle.show = true;
+      $("show-circle").checked = true;
+    }
+    renderCircle(data);
+    fitTo(currentBounds());
+    setStatus(
+      `选址完成：最大可容圆半径 ${fmtNum(data.radius_m, 3)} m，` +
+        `圆心 (${fmtNum(data.center[0], 3)}, ${fmtNum(data.center[1], 3)})，` +
+        `上界差 ${fmtNum(data.radius_gap_m, 4)} m`,
+      "ok"
+    );
+  } catch (e) {
+    setStatus(`请求失败：${e.message}`, "error");
+  }
+}
+
+$("btn-circle").addEventListener("click", runCircle);
+
+$("btn-view-circle-json").addEventListener("click", () => {
+  if (!lastCircleGeoJSON) return;
+  const panel = $("json-panel");
+  panel.hidden = !panel.hidden;
+  $("json-view").textContent = JSON.stringify(lastCircleGeoJSON, null, 2);
+  if (!panel.hidden) panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+});
+
 $("btn-download").addEventListener("click", () => {
   if (!lastResultGeoJSON || lastResultGeoJSON.features.length === 0) return;
   const blob = new Blob([JSON.stringify(lastResultGeoJSON, null, 2)], {
@@ -1086,6 +1287,7 @@ $("btn-view-json").addEventListener("click", () => {
 
 $("clear-forbidden").addEventListener("click", () => {
   forbiddenInput.value = "";
+  forbiddenInput.dispatchEvent(new Event("input"));
 });
 
 // ---------------------------------------------------------------------------

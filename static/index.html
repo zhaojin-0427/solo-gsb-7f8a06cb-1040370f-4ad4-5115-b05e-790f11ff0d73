@@ -13,7 +13,8 @@
       坐标按<strong>平面米制</strong>解释 · 合并禁建区后从地块扣除 ·
       共点共边不扣面积、重叠禁建区只算一次 ·
       支持逐要素<strong>关系审计</strong>（disjoint / touch / overlap / within / contains / equals）·
-      支持<strong>等面积分段</strong>（按方向角用平行切线等分可建范围）
+      支持<strong>等面积分段</strong>（按方向角用平行切线等分可建范围）·
+      支持<strong>最大可容圆选址</strong>（在可建范围内寻找最大内切圆）
     </p>
   </header>
 
@@ -61,6 +62,19 @@
           按投影递增编号；修改任一输入会清除旧分段。
         </p>
       </div>
+
+      <div class="field circle-box">
+        <div class="field-head">
+          <label>最大可容圆选址（先扣禁建区，再在可建范围所有独立面上找最大内切圆）</label>
+        </div>
+        <div class="subdivide-controls">
+          <button type="button" id="btn-circle" class="btn btn-primary">最大可容圆选址</button>
+        </div>
+        <p class="subdivide-hint">
+          半径取圆心到边界（外边界与孔洞）的实际最短距离；
+          返回最大半径上界，保证上界与半径相差不超过 0.01 米；修改任一输入会清除旧结果。
+        </p>
+      </div>
       <div id="status" class="status" role="status"></div>
     </section>
 
@@ -75,6 +89,8 @@
             <input type="checkbox" id="show-result" checked /></label>
           <label class="toggle"><span class="swatch swatch-segments"></span>分段
             <input type="checkbox" id="show-segments" checked /></label>
+          <label class="toggle"><span class="swatch swatch-circle"></span>最大可容圆
+            <input type="checkbox" id="show-circle" checked /></label>
         </div>
         <div class="map-actions">
           <button type="button" class="btn btn-small" id="btn-zoom-in">＋</button>
@@ -131,6 +147,14 @@
           下载分段 GeoJSON
         </button>
         <button type="button" id="btn-view-subdivide-json" class="btn">查看分段 JSON</button>
+      </div>
+    </section>
+
+    <section class="panel circle-panel" id="circle-panel" hidden>
+      <h2>最大可容圆选址</h2>
+      <div class="circle-metrics" id="circle-metrics"></div>
+      <div class="result-actions">
+        <button type="button" id="btn-view-circle-json" class="btn">查看圆 GeoJSON</button>
       </div>
     </section>
 

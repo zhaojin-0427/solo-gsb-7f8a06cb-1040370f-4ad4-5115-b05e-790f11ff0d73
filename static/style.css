@@ -13,6 +13,8 @@
   --forbidden-stroke: #d64545;
   --result-fill: rgba(34, 160, 100, 0.28);
   --result-stroke: #1c8a4f;
+  --circle-fill: rgba(217, 168, 59, 0.22);
+  --circle-stroke: #c98a12;
 }
 
 * { box-sizing: border-box; }
@@ -137,6 +139,7 @@ textarea:focus { outline: 2px solid rgba(31, 111, 235, 0.35); border-color: var(
 .swatch-forbidden { background: var(--forbidden-fill); border-color: var(--forbidden-stroke); }
 .swatch-result { background: var(--result-fill); border-color: var(--result-stroke); }
 .swatch-segments { background: rgba(126, 79, 209, 0.25); border-color: #7e4fd1; }
+.swatch-circle { background: var(--circle-fill); border-color: var(--circle-stroke); }
 .map-actions { display: flex; gap: 6px; }
 
 .canvas-wrap {
@@ -312,6 +315,35 @@ textarea:focus { outline: 2px solid rgba(31, 111, 235, 0.35); border-color: var(
 .segment-title { font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .segment-swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; }
 .segment-metrics { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* ---- 最大可容圆 ---- */
+.circle-box {
+  border-top: 1px dashed var(--border);
+  padding-top: 12px;
+  margin-bottom: 0;
+}
+.circle-panel { grid-column: 1 / -1; border-color: #e6c883; }
+.circle-panel h2 { margin: 0 0 10px; font-size: 15px; color: #9a6a00; }
+.circle-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+}
+.circle-metric {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: #fbfcfd;
+}
+.circle-metric-main {
+  border-color: var(--circle-stroke);
+  background: rgba(217, 168, 59, 0.08);
+}
+.circle-metric .stat-label { font-size: 12px; color: var(--muted); }
+.circle-metric .stat-value { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
 
 .json-panel { grid-column: 1 / -1; }.json-panel h2 { margin: 0 0 8px; font-size: 15px; }
 #json-view {
