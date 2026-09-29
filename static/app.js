@@ -29,6 +29,11 @@ const LAYERS = {
     width: 2,
   },
   segments: { show: true }, // 分段按段着色，颜色取自 SEGMENT_COLORS
+  circle: {
+    show: true,
+    polygon: null, // 圆（用 128 段正多边形渲染）
+    center: null, // [x, y]
+  },
 };
 
 // 等面积分段的调色板（最多 12 段，与分段数量上限一致）
@@ -44,6 +49,7 @@ const view = {
   forbiddenPolys: [], // 全部禁建区面（用于范围计算）
   forbiddenGroups: [], // [{polys, name}] 按原始要素分组，组下标即要素索引
   resultPolys: [],
+  circleResult: null, // {polygon, center, radius, ...}
   issues: [],
   activeIssue: -1,
   relations: [],
@@ -339,6 +345,7 @@ function draw() {
   if (LAYERS.forbidden.show) drawForbidden();
   if (LAYERS.result.show) drawLayer(view.resultPolys, "result");
   if (LAYERS.segments.show) drawSegments();
+  if (LAYERS.circle.show) drawCircle();
 
   drawIssueMarkers();
 }
@@ -397,6 +404,41 @@ function drawSegments() {
       ctx.fillText(`段 ${i + 1}`, sx, sy);
     }
   });
+}
+
+function drawCircle() {
+  const res = view.circleResult;
+  if (!res) return;
+  const stroke = "#d9841d";
+  const fill = "rgba(217,132,29,0.22)";
+  if (res.polygon) {
+    const path = polygonPath(res.polygon);
+    ctx.fillStyle = fill;
+    ctx.fill(path, "evenodd");
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2.5;
+    ctx.stroke(path);
+  }
+  if (res.center) {
+    const [sx, sy] = toScreen(res.center[0], res.center[1]);
+    ctx.beginPath();
+    ctx.arc(sx, sy, 4, 0, Math.PI * 2);
+    ctx.fillStyle = stroke;
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#ffffff";
+    ctx.stroke();
+    // 半径标注
+    ctx.font = "bold 13px sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "rgba(255,255,255,0.9)";
+    const label = `r = ${fmtNum(res.radius, 3)} m`;
+    ctx.strokeText(label, sx + 8, sy - 8);
+    ctx.fillStyle = stroke;
+    ctx.fillText(label, sx + 8, sy - 8);
+  }
 }
 
 function drawIssueMarkers() {
@@ -472,6 +514,8 @@ function currentBounds() {
   b = mergeBounds(b, boundsOf(view.forbiddenPolys));
   b = mergeBounds(b, boundsOf(view.resultPolys));
   for (const seg of view.segments) b = mergeBounds(b, boundsOf(seg.polys));
+  if (view.circleResult && view.circleResult.polygon)
+    b = mergeBounds(b, boundsOf([view.circleResult.polygon]));
   return b;
 }
 
@@ -480,6 +524,7 @@ for (const [key, id] of [
   ["forbidden", "show-forbidden"],
   ["result", "show-result"],
   ["segments", "show-segments"],
+  ["circle", "show-circle"],
 ]) {
   $(id).addEventListener("change", (e) => {
     LAYERS[key].show = e.target.checked;
@@ -578,6 +623,17 @@ function focusIssue(i) {
 
 let lastResultGeoJSON = null;
 let lastSubdivideGeoJSON = null;
+let lastCircleGeoJSON = null;
+
+/** 清除最大可容圆结果（输入变更或执行其他动作时调用）。 */
+function clearCircle() {
+  view.circleResult = null;
+  lastCircleGeoJSON = null;
+  $("circle-panel").hidden = true;
+  $("circle-summary").textContent = "";
+  $("circle-part-list").innerHTML = "";
+  draw();
+}
 
 /** 清除关系审计结果与高亮（重新预览 / 裁切 / 输入变更时调用）。 */
 function resetRelations() {
@@ -599,9 +655,12 @@ function clearSubdivision() {
   draw();
 }
 
-// 任一输入（地块 / 禁建区 / 数量 / 角度）改变时清除旧分段
+// 任一输入（地块 / 禁建区 / 数量 / 角度）改变时清除旧分段与旧选址圆
 for (const el of [parcelInput, forbiddenInput, $("subdivide-count"), $("subdivide-angle")]) {
-  el.addEventListener("input", clearSubdivision);
+  el.addEventListener("input", () => {
+    clearSubdivision();
+    clearCircle();
+  });
 }
 
 function readInputs() {
@@ -633,6 +692,7 @@ function previewInputs() {
   renderIssues([]);
   resetRelations();
   clearSubdivision();
+  clearCircle();
   lastResultGeoJSON = null;
   $("btn-download").disabled = true;
   $("btn-view-json").disabled = true;
@@ -669,6 +729,7 @@ async function runClip() {
   renderIssues([]);
   resetRelations();
   clearSubdivision();
+  clearCircle();
   lastResultGeoJSON = null;
   $("btn-download").disabled = true;
   $("btn-view-json").disabled = true;
@@ -825,6 +886,7 @@ async function runRelations() {
   renderIssues([]);
   resetRelations();
   clearSubdivision();
+  clearCircle();
   lastResultGeoJSON = null;
   $("btn-download").disabled = true;
   $("btn-view-json").disabled = true;
@@ -971,6 +1033,7 @@ async function runSubdivide() {
   renderIssues([]);
   resetRelations();
   clearSubdivision();
+  clearCircle();
   lastResultGeoJSON = null;
   $("btn-download").disabled = true;
   $("btn-view-json").disabled = true;
@@ -1062,6 +1125,129 @@ $("btn-view-subdivide-json").addEventListener("click", () => {
   $("json-view").textContent = JSON.stringify(lastSubdivideGeoJSON, null, 2);
   if (!panel.hidden) panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 });
+
+// ---------------------------------------------------------------------------
+// 最大可容圆选址
+// ---------------------------------------------------------------------------
+
+function renderCircle(data) {
+  view.circleResult = {
+    polygon: null,
+    center: data.center,
+    radius: data.radius_m,
+    upperBound: data.radius_upper_bound_m,
+  };
+  lastCircleGeoJSON = data.result;
+  const circleFeature = (data.result.features || []).find(
+    (f) => f.properties && f.properties.kind === "inscribed_circle"
+  );
+  if (circleFeature) {
+    view.circleResult.polygon = extractPolygons([circleFeature.geometry])[0] || null;
+  }
+
+  const panel = $("circle-panel");
+  panel.hidden = false;
+  $("circle-summary").innerHTML =
+    `圆心 <b>(${fmtNum(data.center[0], 3)}, ${fmtNum(data.center[1], 3)})</b>` +
+    `（独立面 ${data.part}/${data.part_count}）<br />` +
+    `<span class="circle-figures">` +
+    `<span>半径 <b>${fmtNum(data.radius_m, 3)} m</b></span>` +
+    `<span>最大半径上界 <b>${fmtNum(data.radius_upper_bound_m, 3)} m</b></span>` +
+    `<span>上界 − 半径 <b>${fmtNum(data.radius_gap_m, 4)} m</b>（≤ 0.01 m）</span>` +
+    `</span>`;
+
+  const list = $("circle-part-list");
+  list.innerHTML = "";
+  data.parts.forEach((s) => {
+    const li = document.createElement("li");
+    if (s.part === data.part) li.classList.add("winner");
+    const title = document.createElement("div");
+    title.className = "circle-part-title";
+    const badge = document.createElement("span");
+    badge.className = "circle-badge";
+    badge.textContent = s.part === data.part ? "最大圆所在面" : "独立面";
+    const name = document.createElement("span");
+    name.textContent = `面 ${s.part}`;
+    title.appendChild(badge);
+    title.appendChild(name);
+    const metrics = document.createElement("div");
+    metrics.className = "circle-part-metrics";
+    metrics.textContent =
+      `圆心 (${fmtNum(s.center[0], 3)}, ${fmtNum(s.center[1], 3)}) · ` +
+      `半径 ${fmtNum(s.radius_m, 3)} m · ` +
+      `上界 ${fmtNum(s.radius_upper_bound_m, 3)} m · ` +
+      `面积 ${fmtArea(s.area_m2)}`;
+    li.appendChild(title);
+    li.appendChild(metrics);
+    list.appendChild(li);
+  });
+  draw();
+}
+
+async function runInscribedCircle() {
+  $("json-panel").hidden = true;
+  renderStats(null);
+  renderIssues([]);
+  resetRelations();
+  clearSubdivision();
+  clearCircle();
+  lastResultGeoJSON = null;
+  $("btn-download").disabled = true;
+  $("btn-view-json").disabled = true;
+  view.resultPolys = [];
+
+  let payload;
+  try {
+    payload = readInputs();
+  } catch (e) {
+    setStatus(e.message, "error");
+    return;
+  }
+
+  try {
+    setPreviewLayers(payload);
+  } catch {
+    /* 预览失败不影响请求 */
+  }
+
+  setStatus("正在计算最大可容圆…");
+  try {
+    const resp = await fetch("/api/inscribed-circle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+
+    if (!data.ok) {
+      renderIssues(data.issues || []);
+      fitTo(mergeBounds(currentBounds(), issueBounds(view.issues)) || currentBounds());
+      setStatus(
+        data.error + (data.issues && data.issues.length
+          ? `（共 ${data.issues.length} 个问题，点击列表可定位）`
+          : ""),
+        "error"
+      );
+      return;
+    }
+
+    renderStats(data.areas);
+    renderIssues([]);
+    renderCircle(data);
+    fitTo(currentBounds());
+    setStatus(
+      `选址完成：圆心 (${fmtNum(data.center[0], 3)}, ${fmtNum(data.center[1], 3)})，` +
+      `半径 ${fmtNum(data.radius_m, 3)} m，` +
+      `上界 ${fmtNum(data.radius_upper_bound_m, 3)} m` +
+      `（差 ${fmtNum(data.radius_gap_m, 4)} m ≤ 0.01 m）`,
+      "ok"
+    );
+  } catch (e) {
+    setStatus(`请求失败：${e.message}`, "error");
+  }
+}
+
+$("btn-circle").addEventListener("click", runInscribedCircle);
 
 $("btn-download").addEventListener("click", () => {
   if (!lastResultGeoJSON || lastResultGeoJSON.features.length === 0) return;

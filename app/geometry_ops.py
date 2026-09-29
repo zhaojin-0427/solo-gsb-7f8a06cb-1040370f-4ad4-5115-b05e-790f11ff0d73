@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import heapq
 import math
 import re
 from typing import Any
@@ -19,9 +20,12 @@ from shapely import is_valid_reason, union_all
 from shapely.geometry import (
     LineString,
     MultiPolygon,
+    Point,
     Polygon,
+    box,
 )
 from shapely.geometry.base import BaseGeometry
+from shapely.prepared import prep
 from shapely.strtree import STRtree
 
 # 小于该面积（平方米）视为零面积退化环
@@ -975,5 +979,244 @@ def subdivide_parcel(
         "total_area": total,
         "target_area": total / count,
         "area_tolerance": tol,
+        "areas": clip["areas"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 最大可容圆选址
+# ---------------------------------------------------------------------------
+
+# 对外保证：最大半径上界与实际半径之差不超过该值（米）
+INSCRIBED_CIRCLE_GAP = 0.01
+# 分支定界的内部停止容差：取对外保证的一半，留出浮点 / 多面汇总余量
+INSCRIBED_CIRCLE_BB_GAP = 0.005
+# 格子边长小于该值（米）后不再细分：该尺度内净空变化不超过格子半对角，
+# 远小于停止容差；同时避免最优圆心恰在角平分线上时无限细分
+INSCRIBED_CIRCLE_MIN_CELL = 0.0005
+# 分支定界弹出格子数的安全上限
+INSCRIBED_CIRCLE_MAX_CELLS = 2_000_000
+# 圆心到边界的距离不大于该值（米）时认为输入退化（正面积面不会出现）
+INSCRIBED_CIRCLE_MIN_R = 1e-9
+
+
+class InscribedCircleError(Exception):
+    """最大可容圆选址的前置条件不满足（如可建范围为空）。"""
+
+
+def _polygon_edge_segments(poly: Polygon) -> list[LineString]:
+    """收集一个 Polygon 全部环（外环 + 孔洞环）的边。
+
+    孔洞环的边与外环边一同进入最短距离计算，因此孔洞与外边界一样
+    限制圆半径。
+    """
+    edges: list[LineString] = []
+    rings = [poly.exterior, *poly.interiors]
+    for ring in rings:
+        coords = list(ring.coords)
+        for i in range(len(coords) - 1):
+            if not _same_point(coords[i], coords[i + 1]):
+                edges.append(LineString([coords[i], coords[i + 1]]))
+    return edges
+
+
+def _largest_circle_in_polygon(poly: Polygon) -> dict:
+    """在单个面（可带孔洞）内求完全位于面内的最大圆（分支定界）。
+
+    目标函数 f(p) = p 到面边界（外环 + 孔洞环全部边）的最短距离，
+    即圆心 p 所能容纳圆的实际半径；f 在整个平面上是 1-Lipschitz 连续的。
+
+    对包围盒矩形格子 Q = [x0,x1]×[y0,y1]，取距 Q 最近的边 e*（STRtree），
+    则对任意 p ∈ Q 有
+
+        f(p) ≤ d(p, e*) ≤ max_{c 是 Q 的四个角点} d(c, e*) = UB(Q)，
+
+    因为“点到一条线段的距离”是凸函数，而 Q 是四个角点的凸包。注意
+    不能用“各角点 f 值的最大值”作上界——角点的最近边可能不同。
+
+    格子按上界进入**最大堆（best-first）**：每次弹出上界最大的格子，
+    在其中心 / 边中点采样更新当前最优圆心与半径（只采纳严格位于面内的
+    点，半径取到边界的**实际最短距离**，不用质心 / 包围盒中心估计），
+    再沿较长边一分为二。当弹出格子的上界 ≤ 当前最优 + 0.005 时停止：
+    堆中其余格子上界都不大于它，故全局最优 r* 满足
+
+        r_feas ≤ r* ≤ r_feas + 0.005，上界 − 半径 ≤ 0.005 < 0.01 米。
+
+    最优圆心可能恰在角平分线上（格子永远含一对等距边），故再设
+    0.0005 米的最小格子尺寸兜底（该尺度内净空变化 ≤ 半对角 ≪ 容差）。
+    """
+    minx, miny, maxx, maxy = poly.bounds
+    if (
+        not all(math.isfinite(v) for v in poly.bounds)
+        or maxx - minx <= INSCRIBED_CIRCLE_MIN_R
+        or maxy - miny <= INSCRIBED_CIRCLE_MIN_R
+    ):
+        raise InscribedCircleError("可建范围退化（包围盒为零宽 / 零高），无法进行最大可容圆选址")
+
+    edges = _polygon_edge_segments(poly)
+    if not edges:
+        raise InscribedCircleError("可建范围退化（没有有效边界），无法进行最大可容圆选址")
+    tree = STRtree(edges)
+    prepared = prep(poly)
+    boundary = poly.boundary
+
+    def cell_upper_bound(x0: float, y0: float, x1: float, y1: float) -> float:
+        """矩形格子 Q 的上界：距 Q 最近的边 e* 到 Q 四角距离的最大值。"""
+        rect = box(x0, y0, x1, y1)
+        nearest = edges[int(tree.nearest(rect))]
+        return max(
+            float(Point(cx, cy).distance(nearest))
+            for cx, cy in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+        )
+
+    # 初始可行圆心：representative_point 保证位于面内（不取质心 / 包围盒中心）
+    rep = poly.representative_point()
+    best_x, best_y = float(rep.x), float(rep.y)
+    best_r = float(rep.distance(boundary))
+    if best_r <= INSCRIBED_CIRCLE_MIN_R:
+        raise InscribedCircleError("可建范围退化（圆心到边界距离为 0），无法进行最大可容圆选址")
+
+    cx, cy = 0.5 * (minx + maxx), 0.5 * (miny + maxy)
+    quads = [
+        (minx, miny, cx, cy),
+        (cx, miny, maxx, cy),
+        (cx, cy, maxx, maxy),
+        (minx, cy, cx, maxy),
+    ]
+    heap: list[tuple[float, float, float, float, float]] = []
+    for q in quads:
+        if prepared.intersects(box(q[0], q[1], q[2], q[3])):
+            heapq.heappush(heap, (-cell_upper_bound(*q), *q))
+
+    stop = best_r + INSCRIBED_CIRCLE_BB_GAP
+    popped = 0
+    while heap:
+        neg_ub, x0, y0, x1, y1 = heapq.heappop(heap)
+        ub = -neg_ub
+        popped += 1
+        if popped > INSCRIBED_CIRCLE_MAX_CELLS:  # pragma: no cover - 仅退化输入触发
+            raise InscribedCircleError("可建范围形状过于复杂，最大可容圆求解超过安全上限")
+        if ub <= stop + 1e-12:
+            break  # 堆按 -ub 排序：其余格子的上界都不大于 ub
+
+        # 中心与四个边中点采样（点必须严格位于面内，孔洞处自然被排除）
+        mx, my = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+        for sx, sy in ((mx, my), (mx, y0), (mx, y1), (x0, my), (x1, my)):
+            pt = Point(sx, sy)
+            if prepared.contains(pt):
+                d = float(pt.distance(boundary))
+                if d > best_r:
+                    best_x, best_y, best_r = sx, sy, d
+                    stop = best_r + INSCRIBED_CIRCLE_BB_GAP
+
+        if max(x1 - x0, y1 - y0) <= INSCRIBED_CIRCLE_MIN_CELL:
+            continue
+        # 沿较长边一分为二（减少瘦长格子上的冗余细分）
+        if x1 - x0 >= y1 - y0:
+            children = ((x0, y0, mx, y1), (mx, y0, x1, y1))
+        else:
+            children = ((x0, y0, x1, my), (x0, my, x1, y1))
+        for q in children:
+            rect = box(q[0], q[1], q[2], q[3])
+            if not prepared.intersects(rect):
+                continue
+            cub = cell_upper_bound(*q)
+            if cub > stop + 1e-12:
+                heapq.heappush(heap, (-cub, *q))
+
+    # 终止时所有格子分为三类，都可严格认证：
+    # 1) 入堆前 / 弹出时按“上界 ≤ best+gap”剪枝（best 只增不减）；
+    # 2) 与面不相交（无内部点）直接丢弃；
+    # 3) 达到最小格子尺寸：其中心点已采样（f(中心) ≤ best），格内任意点
+    #    与中心的距离 ≤ 半对角 = √2/2·0.0005 ≈ 0.00036，由 1-Lipschitz
+    #    知格内 f ≤ best + 0.00036 < best + 0.005。
+    # 故全局最优 r* ≤ best + BB_GAP；上界 − 半径 ≤ 0.005 < 0.01 米。
+    upper_bound = best_r + INSCRIBED_CIRCLE_BB_GAP
+    return {"x": best_x, "y": best_y, "r": best_r, "upper_bound": upper_bound}
+
+
+def _circle_polygon(x: float, y: float, r: float, segments_per_quarter: int = 48) -> Polygon:
+    """圆心 (x, y)、半径 r（米）的正多边形近似圆（平面米制）。
+
+    每四分之一圆 48 段（整圆 192 段）：该近似圆为真圆的**内接**正多边形，
+    矢高为 r·(1−cos(π/96)) < r·2e-4，输出几何严格位于真圆之内。
+    """
+    n = max(8, segments_per_quarter * 4)
+    pts = []
+    for i in range(n):
+        a = 2.0 * math.pi * i / n
+        pts.append((x + r * math.cos(a), y + r * math.sin(a)))
+    pts.append(pts[0])
+    return Polygon(pts)
+
+
+def largest_inscribed_circle(
+    parcel_geoms: list[Polygon | MultiPolygon],
+    forbidden_geoms: list[Polygon | MultiPolygon],
+) -> dict:
+    """先求可建范围，再在所有独立面上寻找完全位于范围内的最大圆。
+
+    - 可建范围复用裁切语义（禁建区先并集再差集），每个独立面分别求解，
+      孔洞环与外边界共同限制半径；
+    - 返回半径最大的那个圆：圆心坐标、实际最短距离半径、最大半径上界
+      （保证 0 ≤ 上界 − 半径 ≤ 0.01 米）、所在独立面序号与各面统计；
+    - 可建范围为空（扣空）时抛 InscribedCircleError。
+    """
+    clip = clip_parcel(parcel_geoms, forbidden_geoms)
+    parts = clip["parts"]
+    if not parts:
+        raise InscribedCircleError("地块被禁建区完全扣除，可建范围为 0，无法进行最大可容圆选址")
+
+    part_results = []
+    for i, part in enumerate(parts):
+        sol = _largest_circle_in_polygon(part)
+        part_results.append(
+            {
+                "part": i + 1,
+                "x": sol["x"],
+                "y": sol["y"],
+                "radius": sol["r"],
+                "radius_upper_bound": sol["upper_bound"],
+                "area_m2": float(part.area),
+            }
+        )
+
+    # 半径最大者胜出；半径相同按面序号取较小者（结果稳定）
+    winner = max(part_results, key=lambda s: (s["radius"], -s["part"]))
+
+    x, y, r = winner["x"], winner["y"], winner["radius"]
+    # 求解器中各面的半径都已是圆心到该面边界的实际最短距离；再对**整个
+    # 可建范围**的边界复核一次（多独立面时防止数值抖动）。
+    region = parts[0] if len(parts) == 1 else union_all(parts)
+    exact_r = float(Point(x, y).distance(region.boundary))
+    if 0.0 < exact_r < r:
+        r = exact_r
+        winner["radius"] = r
+
+    # 全局上界取**所有独立面**上界的最大值：全局最优必在某个面 j 内，
+    # 其真实最优 ≤ UB_j ≤ r_j + BB_GAP，而 r_j ≤ r（胜者半径），
+    # 故全局上界 − r ≤ BB_GAP = 0.005 < INSCRIBED_CIRCLE_GAP = 0.01 米。
+    upper_bound = max(s["radius_upper_bound"] for s in part_results)
+    if upper_bound < r:
+        upper_bound = r
+    if upper_bound - r > INSCRIBED_CIRCLE_GAP:  # pragma: no cover - 兜底
+        raise InscribedCircleError("求解异常：最大半径上界超过对外保证")
+
+    circle = _circle_polygon(x, y, r)
+    # 最终校验：近似圆为真圆的内接正多边形（矢高 < r·2e-4），而 r 是圆心
+    # 到边界的实际最短距离，故圆必须完全位于可建范围。
+    outside = circle.difference(region).area
+    if outside > 1e-6:  # pragma: no cover - 兜底：求解器保证在内
+        raise InscribedCircleError("求解异常：候选圆未完全位于可建范围内")
+
+    return {
+        "center": [x, y],
+        "radius": r,
+        "radius_upper_bound": upper_bound,
+        "radius_gap": float(upper_bound - r),
+        "part": winner["part"],
+        "part_count": len(parts),
+        "parts": part_results,
+        "circle": circle,
         "areas": clip["areas"],
     }

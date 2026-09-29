@@ -563,6 +563,159 @@ check("sub: angle=0 合法", len(r["segments"]) == 2)
 r = subdivide_parcel(sq100, [], 2, 179.999)
 check("sub: angle<180 合法", len(r["segments"]) == 2)
 
+# ---------- 33. 最大可容圆：基本解析解 ----------
+from app.geometry_ops import InscribedCircleError, largest_inscribed_circle
+from shapely.geometry import Point as ShapelyPoint
+
+sq_simple = expect_valid(
+    {"type": "Polygon", "coordinates": [[[0, 0], [100, 0], [100, 100], [0, 100], [0, 0]]]},
+    "parcel",
+)
+
+# 33.1 100×100 正方形：r=50，圆心 (50,50)
+r = largest_inscribed_circle(sq_simple, [])
+check("circle: 正方形半径 50", abs(r["radius"] - 50.0) < 1e-6, str(r["radius"]))
+check("circle: 正方形圆心", abs(r["center"][0] - 50.0) < 1e-6 and abs(r["center"][1] - 50.0) < 1e-6)
+check("circle: gap ≤ 0.01", 0.0 <= r["radius_upper_bound"] - r["radius"] <= 0.01 + 1e-9)
+
+# 33.2 半径是圆心到边界的实际最短距离（不用质心 / 包围盒中心）
+d = ShapelyPoint(*r["center"]).distance(sq_simple[0].boundary)
+check("circle: 半径=实际最短距离", abs(d - r["radius"]) < 1e-9, str(d))
+
+# 33.3 120×80 矩形：r=40
+rect = expect_valid(
+    {"type": "Polygon", "coordinates": [[[0, 0], [120, 0], [120, 80], [0, 80], [0, 0]]]},
+    "parcel",
+)
+r = largest_inscribed_circle(rect, [])
+check("circle: 矩形半径 40", abs(r["radius"] - 40.0) < 1e-6)
+
+# 33.4 直角等腰三角形（直角边 100）：内心 r=100(1−1/√2)=100(2−√2)/2
+tri = expect_valid(
+    {"type": "Polygon", "coordinates": [[[0, 0], [100, 0], [0, 100], [0, 0]]]},
+    "parcel",
+)
+r = largest_inscribed_circle(tri, [])
+check("circle: 三角形内心半径",
+      abs(r["radius"] - 100 * (2 - 2 ** 0.5) / 2) < 0.01, str(r["radius"]))
+
+# 33.5 圆近似（正 64 边形外接半径 10）：内切圆半径 10cos(π/64)
+import math as _math
+_n = 64
+_circle_ring = [[10 * _math.cos(2 * _math.pi * i / _n), 10 * _math.sin(2 * _math.pi * i / _n)]
+                for i in range(_n)]
+_circle_ring.append(_circle_ring[0])
+approx_circle = expect_valid({"type": "Polygon", "coordinates": [_circle_ring]}, "parcel")
+r = largest_inscribed_circle(approx_circle, [])
+check("circle: 正64边形半径", abs(r["radius"] - 10 * _math.cos(_math.pi / _n)) < 0.02,
+      str(r["radius"]))
+
+# ---------- 34. 最大可容圆：孔洞限制半径 ----------
+# 100×100 中央 20×20 孔洞：最优在角部，与两边及孔洞角相切，
+# r = 40(2−√2) ≈ 23.4315
+center_hole = expect_valid(
+    {"type": "Polygon", "coordinates": [[[40, 40], [60, 40], [60, 60], [40, 60], [40, 40]]]},
+    "forbidden",
+)
+r = largest_inscribed_circle(sq_simple, center_hole)
+check("circle: 孔洞限制半径", abs(r["radius"] - 40 * (2 - 2 ** 0.5)) < 0.01, str(r["radius"]))
+check("circle: 孔洞 gap ≤ 0.01", 0.0 <= r["radius_upper_bound"] - r["radius"] <= 0.01 + 1e-9)
+# 圆心必须真的在面内、圆不穿进孔洞
+check("circle: 圆心在带孔面内", r["circle"].difference(sq_simple[0]).area == 0.0)
+hole_poly = center_hole[0]
+check("circle: 圆不入侵孔洞", r["circle"].intersection(hole_poly).area < 1e-6)
+
+# 横条禁建区把地块切成上下两个 100×40 的面：r=20
+bar = expect_valid(
+    {"type": "Polygon", "coordinates": [[[0, 40], [100, 40], [100, 60], [0, 60], [0, 40]]]},
+    "forbidden",
+)
+r = largest_inscribed_circle(sq_simple, bar)
+check("circle: 切成两面 r=20", abs(r["radius"] - 20.0) < 1e-6, str(r["radius"]))
+check("circle: 两个独立面都求解", r["part_count"] == 2 and len(r["parts"]) == 2)
+
+# ---------- 35. 最大可容圆：多独立面取最大 ----------
+two_sq = expect_valid(
+    {"type": "MultiPolygon", "coordinates": [
+        [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]],
+        [[[20, 0], [40, 0], [40, 20], [20, 20], [20, 0]]],
+    ]},
+    "parcel",
+)
+r = largest_inscribed_circle(two_sq, [])
+check("circle: 多面取最大 r=10", abs(r["radius"] - 10.0) < 1e-6, str(r["radius"]))
+check("circle: 最大圆在第2面", r["part"] == 2, str(r["part"]))
+check("circle: 逐面结果齐全", len(r["parts"]) == 2 and all("radius_upper_bound" in s for s in r["parts"]))
+
+# ---------- 36. 最大可容圆：共点共边禁建区不影响 ----------
+edge_touch = expect_valid(
+    {"type": "Polygon", "coordinates": [[[20, -10], [80, -10], [80, 0], [20, 0], [20, -10]]]},
+    "forbidden",
+)
+r = largest_inscribed_circle(sq_simple, edge_touch)
+check("circle: 共边禁建不影响 r=50", abs(r["radius"] - 50.0) < 1e-6, str(r["radius"]))
+
+# ---------- 37. 最大可容圆：上界严格不小于半径且差 ≤ 0.01（随机凸多边形）--------
+import random as _random
+from shapely.geometry import MultiPoint as _MultiPoint
+_random.seed(123)
+for trial in range(20):
+    n = _random.randint(5, 14)
+    pts = []
+    for i in range(n):
+        a = 2 * _math.pi * i / n + _random.uniform(-0.04, 0.04)
+        rr = _random.uniform(30, 100)
+        pts.append((rr * _math.cos(a), rr * _math.sin(a)))
+    hull = _MultiPoint(pts).convex_hull  # 保证简单凸多边形
+    obj = {"type": "Polygon", "coordinates": [
+        [list(c) for c in hull.exterior.coords]
+    ]}
+    geoms, issues = validate_layer(obj, "parcel")
+    assert not issues, issues
+    r = largest_inscribed_circle(geoms, [])
+    check(f"circle: 随机凸面 trial={trial} gap 合法",
+          0.0 <= r["radius_upper_bound"] - r["radius"] <= 0.01 + 1e-9)
+    # 独立网格验证：0.5 m 步长网格的最大净空（下界）不应超过返回上界
+    poly = geoms[0]
+    minx, miny, maxx, maxy = poly.bounds
+    grid_best = 0.0
+    step = 0.5
+    gx = minx
+    while gx <= maxx:
+        gy = miny
+        while gy <= maxy:
+            pt = ShapelyPoint(gx, gy)
+            if poly.contains(pt):
+                grid_best = max(grid_best, float(pt.distance(poly.boundary)))
+            gy += step
+        gx += step
+    check(f"circle: 随机凸面 trial={trial} 网格下界≤上界",
+          grid_best <= r["radius_upper_bound"] + step * 2 ** 0.5 + 1e-9,
+          f"{grid_best} vs {r['radius_upper_bound']}")
+    # 半径不得明显低于网格下界（否则没有真正逼近最优）
+    check(f"circle: 随机凸面 trial={trial} 半径逼近网格最优",
+          r["radius"] + 0.01 + step * 2 ** 0.5 >= grid_best,
+          f"r={r['radius']} grid={grid_best}")
+
+# ---------- 38. 最大可容圆：扣空 / 退化报错 ----------
+cover_all = expect_valid(
+    {"type": "Polygon", "coordinates": [[[-1, -1], [101, -1], [101, 101], [-1, 101], [-1, -1]]]},
+    "forbidden",
+)
+try:
+    largest_inscribed_circle(sq_simple, cover_all)
+    check("circle: 扣空报错", False)
+except InscribedCircleError as exc:
+    check("circle: 扣空报错", "扣除" in str(exc) or "可建范围为 0" in str(exc), str(exc))
+
+# 狭长 / 微小正面积面仍可求解（半径 = 半宽）
+thin = expect_valid(
+    {"type": "Polygon", "coordinates": [[[0, 0], [1000, 0], [1000, 1], [0, 1], [0, 0]]]},
+    "parcel",
+)
+r = largest_inscribed_circle(thin, [])
+check("circle: 狭长条 r=0.5", abs(r["radius"] - 0.5) < 1e-6, str(r["radius"]))
+
 print()
 if failures:
     print(f"{len(failures)} 个失败: {failures}")

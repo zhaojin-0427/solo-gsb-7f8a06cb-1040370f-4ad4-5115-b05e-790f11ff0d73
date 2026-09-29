@@ -18,9 +18,11 @@ from .geometry_ops import (
     SUBDIVIDE_MAX_COUNT,
     SUBDIVIDE_MIN_COUNT,
     GeoJSONError,
+    InscribedCircleError,
     SubdivideError,
     audit_relations,
     clip_parcel,
+    largest_inscribed_circle,
     subdivide_parcel,
     validate_layer_indexed,
 )
@@ -233,6 +235,74 @@ def subdivide(req: SubdivideRequest) -> dict:
         "segments": segments_meta,
         "feature_count": len(features),
         "result": {"type": "FeatureCollection", "features": features},
+        "issues": [],
+    }
+
+
+@app.post("/api/inscribed-circle")
+def inscribed_circle(req: ClipRequest) -> dict:
+    """最大可容圆选址：先求可建范围，再在所有独立面上找最大内切圆。"""
+    parcel_records, forbidden_records, err = _validate_payload(req)
+    if err is not None:
+        return err
+    if len(parcel_records) != 1:
+        return _error_response("地块必须恰好包含一个 Polygon / MultiPolygon 要素")
+
+    parcel_geoms = [geom for _, _, geom in parcel_records]
+    forbidden_geoms = [geom for _, _, geom in forbidden_records]
+
+    try:
+        result = largest_inscribed_circle(parcel_geoms, forbidden_geoms)
+    except InscribedCircleError as exc:
+        return _error_response(str(exc))
+
+    [x, y] = result["center"]
+    r = result["radius"]
+    circle_feature = {
+        "type": "Feature",
+        "properties": {
+            "kind": "inscribed_circle",
+            "center_x": x,
+            "center_y": y,
+            "radius_m": r,
+            "radius_upper_bound_m": result["radius_upper_bound"],
+            "radius_gap_m": result["radius_gap"],
+            "part": result["part"],
+        },
+        "geometry": mapping(result["circle"]),
+    }
+    center_feature = {
+        "type": "Feature",
+        "properties": {"kind": "center", "part": result["part"]},
+        "geometry": {"type": "Point", "coordinates": [x, y]},
+    }
+
+    parts_meta = [
+        {
+            "part": s["part"],
+            "center": [s["x"], s["y"]],
+            "radius_m": s["radius"],
+            "radius_upper_bound_m": s["radius_upper_bound"],
+            "area_m2": s["area_m2"],
+        }
+        for s in result["parts"]
+    ]
+
+    return {
+        "ok": True,
+        "center": [x, y],
+        "radius_m": r,
+        "radius_upper_bound_m": result["radius_upper_bound"],
+        "radius_gap_m": result["radius_gap"],
+        "part": result["part"],
+        "part_count": result["part_count"],
+        "parts": parts_meta,
+        "areas": result["areas"],
+        "feature_count": 2,
+        "result": {
+            "type": "FeatureCollection",
+            "features": [circle_feature, center_feature],
+        },
         "issues": [],
     }
 

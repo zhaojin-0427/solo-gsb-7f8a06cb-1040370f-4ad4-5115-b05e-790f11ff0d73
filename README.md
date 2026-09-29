@@ -5,7 +5,9 @@
 **合并（并集）后从地块中扣除**，预览输入与结果、显示剩余面积，并下载结果
 GeoJSON。同时提供**禁建区关系审计**：逐要素判定禁建区相对地块的空间关系
 （相离 / 共点共边 / 部分重叠 / 完全位于地块内 / 包含地块 / 完全一致），以及
-**等面积分段**：先求可建范围，再按指定方向用平行切线把它等分为 2~12 段。
+**等面积分段**：先求可建范围，再按指定方向用平行切线把它等分为 2~12 段；
+以及**最大可容圆选址**：在可建范围的所有独立面上，寻找完全位于范围内
+（孔洞与外边界同时限制半径）的最大圆，给出圆心、实际半径与误差 ≤ 1 厘米的最大半径上界。
 
 - 后端：Python 3.11 + FastAPI + Shapely 2（GEOS）
 - 前端：原生 HTML / CSS / JavaScript（Canvas 渲染，**零第三方依赖**）
@@ -89,20 +91,41 @@ FeatureCollection 原始下标作为稳定索引，无效要素跳过、不影�
 页面可填写**数量**与**角度**，分段结果按段着色并标注段号，点击段列表可高亮，
 可下载分段 GeoJSON；**修改任一输入（地块 / 禁建区 / 数量 / 角度）会自动清除旧分段**。
 
+### 最大可容圆选址（`POST /api/inscribed-circle`）
+
+在裁切得到的**可建范围**（地块 − 禁建区并集）内寻找半径最大的圆：
+
+1. 先按裁切语义计算可建范围；**扣空（可建面积为 0）时报错，不输出圆**。
+2. 对每个**独立面**分别求解（差集可能产生多个不相连的面），最终返回半径
+   最大者所在的面；面的**孔洞与外边界一样限制半径**（圆心到孔洞边的距离
+   同样计入）。
+3. 半径取圆心到面边界（外环 + 全部孔洞环）的**实际最短距离**，不是质心 /
+   包围盒中心的估计值。
+4. 求解用对边界的**分支定界（best-first）**：在包围盒格子上以“距格子最近
+   的边到四角距离的最大值”为严格上界，按上界从大到小细分并在面内采样，
+   保证
+   **0 ≤ 最大半径上界 − 半径 ≤ 0.01 米**（内部停止容差 0.005 米）。
+5. 平面米制下返回圆心 `[x, y]`、`radius_m`、`radius_upper_bound_m` 与
+   `radius_gap_m`（上界减半径），同时给出每个独立面的圆心 / 半径 / 上界 / 面积。
+
+页面点击「最大可容圆选址」即在地图上画出橙色圆与圆心并标注半径，面板列出
+各独立面的数值；**修改任一输入（地块 / 禁建区）会自动清除旧圆**，执行其他
+动作（预览 / 裁切 / 审计 / 分段）也会清除它。
+
 ## 目录结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py            # FastAPI：/api/clip、/api/relations、/api/subdivide、/api/health、静态页面托管
-│   └── geometry_ops.py    # GeoJSON 解析、错误定位、并集差集裁切、关系审计、等面积分段
+│   ├── main.py            # FastAPI：/api/clip、/api/relations、/api/subdivide、/api/inscribed-circle、/api/health、静态页面托管
+│   └── geometry_ops.py    # GeoJSON 解析、错误定位、并集差集裁切、关系审计、等面积分段、最大可容圆
 ├── static/
 │   ├── index.html         # 页面结构
 │   ├── style.css          # 样式
-│   └── app.js             # 输入解析、Canvas 预览/结果/分段渲染、下载（无依赖）
+│   └── app.js             # 输入解析、Canvas 预览/结果/分段/圆渲染、下载（无依赖）
 ├── tests/
-│   ├── test_geometry.py   # 裁切语义、错误定位与等面积分段单元测试
+│   ├── test_geometry.py   # 裁切语义、错误定位、等面积分段与最大可容圆单元测试
 │   └── test_api.py        # HTTP 端到端测试
 ├── requirements.txt
 ├── Dockerfile
@@ -167,7 +190,10 @@ python -m tests.test_api
    从 +x 轴逆时针计），点击「等面积分段」；结果按段着色并标注段号，
    段列表显示每段实际面积 / 目标面积 / 偏差与投影范围，点击可高亮定位，
    「下载分段 GeoJSON」保存结果；修改任一输入会自动清除旧分段。
-8. 地图支持滚轮缩放、拖拽平移、图层开关与「适配视图」。
+8. 最大可容圆选址：点击「最大可容圆选址」；地图画出可建范围内的最大圆
+   （橙色）与圆心并标注半径，面板显示圆心、实际半径、最大半径上界与
+   两者之差（≤ 0.01 m），并逐独立面列出结果；扣空时会提示可建范围为 0。
+9. 地图支持滚轮缩放、拖拽平移、图层开关与「适配视图」。
 
 ## API
 
@@ -320,6 +346,61 @@ python -m tests.test_api
 失败响应（HTTP 200，`ok=false`，不输出分段）：参数非法（count / angle_deg
 越界或非有限数）、输入几何无效（`issues` 定位）、地块要素数不唯一、
 可建范围被完全扣除等。缺少 `count` / `angle_deg` 字段时返回 HTTP 422。
+
+### `POST /api/inscribed-circle`
+
+请求体与 `/api/clip` 完全相同（`parcel` 必填、`forbidden` 可空），GeoJSON
+校验规则也完全一致（无效输入返回同样的 `ok=false` + `issues` 定位结构）。
+成功响应（HTTP 200，`ok=true`）：
+
+```json
+{
+  "ok": true,
+  "center": [60.0, 40.0],
+  "radius_m": 40.0,
+  "radius_upper_bound_m": 40.005,
+  "radius_gap_m": 0.005,
+  "part": 1,
+  "part_count": 1,
+  "parts": [
+    {
+      "part": 1,
+      "center": [60.0, 40.0],
+      "radius_m": 40.0,
+      "radius_upper_bound_m": 40.005,
+      "area_m2": 9600.0
+    }
+  ],
+  "areas": { "parcel_area": 9600.0, "forbidden_union_area": 0.0,
+             "removed_area": 0.0, "remaining_area": 9600.0 },
+  "feature_count": 2,
+  "result": {
+    "type": "FeatureCollection",
+    "features": [
+      { "type": "Feature",
+        "properties": { "kind": "inscribed_circle", "center_x": 60.0,
+                        "center_y": 40.0, "radius_m": 40.0,
+                        "radius_upper_bound_m": 40.005,
+                        "radius_gap_m": 0.005, "part": 1 },
+        "geometry": { "type": "Polygon", "coordinates": [ [ [60.0001,40.0], ... ] ] } },
+      { "type": "Feature",
+        "properties": { "kind": "center", "part": 1 },
+        "geometry": { "type": "Point", "coordinates": [60.0, 40.0] } }
+    ]
+  },
+  "issues": []
+}
+```
+
+- `radius_m`：圆心到可建范围边界（外环 + 孔洞环）的**实际最短距离**（米）；
+  返回的圆（`result` 中的正多边形近似圆）完全位于可建范围内。
+- `radius_upper_bound_m`：真正最优半径的严格上界，恒满足
+  **0 ≤ `radius_upper_bound_m` − `radius_m` ≤ 0.01 米**（`radius_gap_m`
+  即该差值）。
+- `part` / `part_count` / `parts`：圆所在的独立面序号、独立面总数与每个面
+  各自的圆心 / 半径 / 上界 / 面积（从 1 开始编号，半径最大者胜出）。
+- 可建范围被完全扣除时返回 `ok=false`（`error` 说明，无 `result`）；地块
+  要素数不唯一、输入几何无效时同样失败。
 
 ## 说明与限制
 

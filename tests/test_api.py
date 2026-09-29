@@ -1,5 +1,7 @@
 """FastAPI 端点端到端测试。"""
 
+import math as _math
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -359,6 +361,110 @@ r = client.post("/api/subdivide",
                       "count": 2, "angle_deg": 0})
 d = r.json()
 check("subdivide Point 结构错误", not d["ok"] and "结构错误" in d["error"], str(d)[:200])
+
+# ============================ /api/inscribed-circle ============================
+
+ic_parcel = {"type": "Polygon",
+             "coordinates": [[[0, 0], [120, 0], [120, 80], [0, 80], [0, 0]]]}
+
+# 基本选址：120×80 矩形 r=40，圆心 (60,40)
+r = client.post("/api/inscribed-circle", json={"parcel": ic_parcel})
+d = r.json()
+check("circle ok", r.status_code == 200 and d["ok"], str(d)[:300])
+check("circle 半径 40", abs(d["radius_m"] - 40.0) < 1e-6, str(d["radius_m"]))
+check("circle 圆心 (60,40)",
+      abs(d["center"][0] - 60.0) < 1e-6 and abs(d["center"][1] - 40.0) < 1e-6, str(d["center"]))
+check("circle 上界 ≥ 半径", d["radius_upper_bound_m"] >= d["radius_m"])
+check("circle gap ≤ 0.01",
+      0.0 <= d["radius_upper_bound_m"] - d["radius_m"] <= 0.01 + 1e-9,
+      str(d["radius_upper_bound_m"] - d["radius_m"]))
+check("circle gap 字段一致",
+      abs(d["radius_gap_m"] - (d["radius_upper_bound_m"] - d["radius_m"])) < 1e-12)
+check("circle 单独立面", d["part"] == 1 and d["part_count"] == 1 and len(d["parts"]) == 1)
+check("circle 复用裁切统计", d["areas"]["remaining_area"] == 9600.0)
+
+# result 含圆多边形与圆心点两个 Feature
+geoms = {f["properties"]["kind"]: f["geometry"]["type"] for f in d["result"]["features"]}
+check("circle 输出圆+圆心", geoms.get("inscribed_circle") == "Polygon"
+      and geoms.get("center") == "Point", str(geoms))
+check("circle feature_count=2", d["feature_count"] == 2 and len(d["result"]["features"]) == 2)
+# 圆必须完全位于地块内（近似圆面积 ≈ π r² 且差集为 0）
+from shapely.geometry import shape as _cshape
+circle_shape = next(
+    _cshape(f["geometry"]) for f in d["result"]["features"]
+    if f["properties"]["kind"] == "inscribed_circle"
+)
+check("circle 圆在地块内", circle_shape.difference(_cshape(ic_parcel)).area < 1e-6)
+check("circle 圆面积≈πr²", abs(circle_shape.area - _math.pi * 40.0 ** 2) < 2.0,
+      str(circle_shape.area))
+
+# 孔洞限制：中央 40×40 孔洞（40..80 两方居中于 120×80）-> 上下条带高 20，r=20
+ic_hole = {"type": "Polygon",
+           "coordinates": [[[40, 20], [80, 20], [80, 60], [40, 60], [40, 20]]]}
+r = client.post("/api/inscribed-circle",
+                json={"parcel": ic_parcel, "forbidden": ic_hole})
+d = r.json()
+check("circle 孔洞限制 r=20", d["ok"] and abs(d["radius_m"] - 20.0) < 1e-6, str(d)[:200])
+check("circle 孔洞 gap ≤ 0.01",
+      abs((d["radius_upper_bound_m"] - d["radius_m"])) <= 0.01 + 1e-9)
+
+# 横条禁建切成两个独立面：两个面都给出结果
+ic_bar = {"type": "Polygon",
+          "coordinates": [[[0, 30], [120, 30], [120, 50], [0, 50], [0, 30]]]}
+r = client.post("/api/inscribed-circle",
+                json={"parcel": ic_parcel, "forbidden": ic_bar})
+d = r.json()
+check("circle 两个独立面", d["ok"] and d["part_count"] == 2 and len(d["parts"]) == 2, str(d)[:200])
+check("circle 两面 r=15",
+      all(abs(p["radius_m"] - 15.0) < 1e-6 for p in d["parts"]), str(d["parts"]))
+check("circle 最大圆面号", d["part"] in (1, 2))
+
+# 无禁建区 / null
+r = client.post("/api/inscribed-circle", json={"parcel": ic_parcel, "forbidden": None})
+check("circle null 禁建区", r.json()["ok"] and abs(r.json()["radius_m"] - 40.0) < 1e-6)
+
+# 扣空 -> ok=false，不输出 result
+ic_cover = {"type": "Polygon",
+            "coordinates": [[[-1, -1], [121, -1], [121, 81], [-1, 81], [-1, -1]]]}
+r = client.post("/api/inscribed-circle",
+                json={"parcel": ic_parcel, "forbidden": ic_cover})
+d = r.json()
+check("circle 扣空报错", not d["ok"] and "扣除" in d["error"], str(d)[:200])
+check("circle 扣空无结果", "result" not in d and "radius_m" not in d)
+
+# 无效几何 -> 同一套校验与定位
+r = client.post("/api/inscribed-circle",
+                json={"parcel": {"type": "Polygon",
+                                 "coordinates": [[[0, 0], [1, 0], [2, 0], [0, 0]]]}})
+d = r.json()
+check("circle 无效几何报错", not d["ok"] and d["issues"][0]["code"] == "ZERO_AREA_RING", str(d)[:200])
+
+# 禁建区无效
+r = client.post("/api/inscribed-circle", json={"parcel": ic_parcel, "forbidden": bad_forbidden})
+d = r.json()
+check("circle 禁建区无效报错",
+      not d["ok"] and all(i["layer"] == "forbidden" for i in d["issues"]), str(d)[:200])
+
+# 多地块拒绝
+r = client.post("/api/inscribed-circle", json={"parcel": two_parcels})
+d = r.json()
+check("circle 多地块拒绝", not d["ok"] and "恰好包含一个" in d["error"], str(d)[:200])
+
+# 结构错误
+r = client.post("/api/inscribed-circle",
+                json={"parcel": {"type": "Point", "coordinates": [1, 2]}})
+d = r.json()
+check("circle Point 结构错误", not d["ok"] and "结构错误" in d["error"], str(d)[:200])
+
+# 缺地块 -> 422
+r = client.post("/api/inscribed-circle", json={"forbidden": None})
+check("circle 缺地块 422", r.status_code == 422)
+
+# MultiPolygon 地块（两个分离 10×10 正方形，r=5）
+r = client.post("/api/inscribed-circle", json={"parcel": two_sq})
+d = r.json()
+check("circle MP 地块", d["ok"] and d["part_count"] == 2 and abs(d["radius_m"] - 5.0) < 1e-6,
+      str(d)[:200])
 
 print()
 if fails:
